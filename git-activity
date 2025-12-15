@@ -6,7 +6,7 @@ function usage() {
   cat <<EOF
 Usage: $0 [-h] [-n] [-s style]
 
-Display an activity graph (like the contribution graph on GitHub) for the 
+Display an activity graph (like the contribution graph on GitHub) for the
 current git repository and branch
 
 Available options:
@@ -62,22 +62,81 @@ esac
 # Use GNU date if available
 if date --version >/dev/null 2>&1 ; then
   function _date { date "$@" ;}
-elif gdate >/dev/null 2>&1 ; then
+elif command -v gdate >/dev/null 2>&1 ; then
   function _date { gdate "$@" ;}
 else
-  echo "You need to install coreutils to run this script (command 'gdate' is not available).";
-  exit 1;
+  # Try to use system date (BSD/macOS)
+  function _date {
+    # For BSD date on macOS
+    if [[ "$1" == "--date" ]] || [[ "$1" == "-d" ]]; then
+      shift
+      # Try to parse the date - this is a simplified version
+      if [[ "$1" =~ ^[0-9]+\ year ]]; then
+        # Handle relative dates like "1 year ago"
+        python3 -c "
+import datetime, sys, re
+from dateutil.relativedelta import relativedelta
+try:
+    from dateutil import parser
+    now = datetime.datetime.now()
+    text = sys.argv[1]
+    if 'year ago' in text:
+        years = int(text.split()[0])
+        dt = now - relativedelta(years=years)
+        print(dt.strftime('%Y-%m-%d'))
+except ImportError:
+    # Fallback if dateutil not installed
+    import subprocess
+    subprocess.run(['date', '-v', '-1y', '+%Y-%m-%d'])
+" "$1" 2>/dev/null || date -v-1y "+%Y-%m-%d"
+      else
+        # Try to parse absolute date
+        date -jf "%Y-%m-%d" "$1" "+%s" 2>/dev/null || date "$@"
+      fi
+    else
+      date "$@"
+    fi
+  }
 fi
 
 # Process commits per day
-declare -A commits_per_day
+# Using a more compatible approach instead of associative arrays
+declare -a commits_per_day
+for i in {0..371}; do
+  commits_per_day[i]=0
+done
+
 commits_max=0
-since=$(_date -d "$(_date -d '1 year ago + 1 day' +"%F -%u day")" +"%s")
-while read -r commits_n commits_date; do
+# Get since date - 1 year ago
+since_str=$(_date -d "1 year ago" "+%Y-%m-%d" 2>/dev/null || _date -v-1y "+%Y-%m-%d")
+since=$(_date -d "${since_str}" "+%s" 2>/dev/null || _date -jf "%Y-%m-%d" "${since_str}" "+%s")
+
+# Process git log output
+while IFS= read -r line; do
+  if [[ -z "$line" ]]; then continue; fi
+
+  # Parse uniq -c output (leading whitespace, count, date)
+  commits_n=$(echo "$line" | awk '{print $1}')
+  commits_date=$(echo "$line" | awk '{print $2}')
+
+  if [[ -z "$commits_date" ]]; then continue; fi
+
   (( commits_n > commits_max )) && commits_max=$commits_n
-  date_diff=$(( ($(_date --date="${commits_date} 13:00 UTC" "+%s") - since) / (60*60*24) ))
-  commits_per_day["${date_diff}"]=$commits_n
-done <<< $(git log --since="${since}" --date=short --pretty=format:'%ad'  | uniq -c)
+
+  # Calculate days difference
+  date_ts=$(_date -d "${commits_date} 13:00 UTC" "+%s" 2>/dev/null || _date -jf "%Y-%m-%d" "${commits_date}" "+%s")
+  date_diff=$(( (date_ts - since) / (60*60*24) ))
+
+  # Store if within range
+  if (( date_diff >= 0 && date_diff < 372 )); then
+    commits_per_day[date_diff]=$commits_n
+  fi
+done < <(git log --since="${since_str}" --date=short --pretty=format:'%ad' 2>/dev/null | sort | uniq -c)
+
+# If no commits found, set a default max to avoid division by zero
+if (( commits_max == 0 )); then
+  commits_max=1
+fi
 
 # Print name of months
 current_month=$(_date "+%b")
@@ -85,7 +144,7 @@ limit_columns=$(( 2 - ${#space} ))
 weeks_in_month=$(( limit_columns + 1 ))
 printf "\e[m    "
 for week_n in $(seq 0 52); do
-  month_week=$(_date -d "1 year ago + ${week_n} weeks" "+%b")
+  month_week=$(_date -d "1 year ago + ${week_n} weeks" "+%b" 2>/dev/null || _date -v-1y -v+"${week_n}w" "+%b")
   if [[ "${current_month}" != "${month_week}" ]]; then
     current_month=$month_week
     weeks_in_month=0
@@ -104,24 +163,29 @@ for day_n in $(seq 0 6); do
   printf '\e[m%-4s' "${name_of_days[day_n]}"
   for week_n in $(seq 0 52); do
     key=$(( week_n * 7 + day_n ))
-    if [[ -v commits_per_day["${key}"] ]]; then
-      value=$(( ${commits_per_day["${key}"]}00 / commits_max))
-      if (( value <= 25 )); then
+    value=${commits_per_day[key]:-0}
+
+    if (( value > 0 )); then
+      scaled_value=$(( value * 100 / commits_max ))
+      if (( scaled_value <= 25 )); then
         # Low activity
         printf "\x1b[38;5;22m%s%s" "$char_full" "$space"
-      elif (( value <= 50 )); then
+      elif (( scaled_value <= 50 )); then
         # Mid-low activity
         printf "\x1b[38;5;28m%s%s" "$char_full" "$space"
-      elif (( value <= 75 )); then
+      elif (( scaled_value <= 75 )); then
         # Mid-high activity
         printf "\x1b[38;5;34m%s%s" "$char_full" "$space"
       else
         # High activity
         printf "\x1b[38;5;40m%s%s" "$char_full" "$space"
       fi
-    elif [ $key -lt $last_day ]; then
+    elif (( key < last_day )); then
       # No activity
       printf "\x1b[38;5;250m%s%s" "$char_void" "$space"
+    else
+      # Future or no data
+      printf "  "
     fi
   done
   printf "\n"
